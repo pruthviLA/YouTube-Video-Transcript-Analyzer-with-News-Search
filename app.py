@@ -18,85 +18,119 @@ import time
 import random
 from pytrends.request import TrendReq
 import os
-from openai import OpenAI
+import openai
+import hashlib
+import threading
 import concurrent.futures
+from urllib.parse import urlparse
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Set page title and favicon
 st.set_page_config(
-    page_title="AI-Enhanced Content Analysis & News Finder",
-    page_icon="📰",
+    page_title="AI Content Analyzer & News Finder",
+    page_icon="🧠",
     layout="wide"
 )
 
 # Initialize NLTK resources
 @st.cache_resource
-def download_nltk_resources():
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        nltk.download('punkt')
-    try:
-        nltk.data.find('corpora/stopwords')
-    except LookupError:
-        nltk.download('stopwords')
-    try:
-        nltk.data.find('corpora/wordnet')
-    except LookupError:
-        nltk.download('wordnet')
+def initialize_nltk():
+    resources = ['punkt', 'stopwords', 'wordnet']
+    for resource in resources:
+        try:
+            nltk.data.find(f'tokenizers/{resource}' if resource == 'punkt' else f'corpora/{resource}')
+        except LookupError:
+            nltk.download(resource)
 
-download_nltk_resources()
+initialize_nltk()
 
 # API Keys and Configurations
 YOUTUBE_API_KEY = st.secrets["YOUTUBE_API_KEY"]
-BING_SEARCH_API_KEY = st.secrets["BING_SEARCH_API_KEY"]
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-BING_SEARCH_ENDPOINT = "https://api.bing.microsoft.com/v7.0/news/search"
 
 # Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai.api_key = OPENAI_API_KEY
+client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-# Advanced Web Scraping Class
-class WebScraper:
-    """Enhanced web scraper for news sources with proxy rotation and error handling"""
+# Cache for storing API responses
+cache = {}
+
+def get_cache_key(func_name, *args, **kwargs):
+    """Generate a cache key based on function name and arguments"""
+    key_parts = [func_name]
+    key_parts.extend([str(arg) for arg in args])
+    key_parts.extend([f"{k}:{v}" for k, v in sorted(kwargs.items())])
+    return hashlib.md5(":".join(key_parts).encode()).hexdigest()
+
+# Advanced Web Scraper class with proxy rotation and rate limiting
+class AdvancedWebScraper:
+    """Advanced web scraper with proxy rotation, rate limiting and caching"""
     
     def __init__(self):
+        self.session = requests.Session()
         self.user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36"
         ]
-        self.google_news_url = "https://news.google.com/search"
-        self.timeout = 10
-        self.max_retries = 3
-        self.delay_between_requests = (1, 3)  # Random delay range in seconds
-        
+        self.last_request_time = {}
+        self.min_request_interval = 2  # seconds between requests to the same domain
+    
     def _get_random_user_agent(self):
-        """Get a random user agent from the list"""
+        """Return a random user agent"""
         return random.choice(self.user_agents)
     
-    def _get_headers(self):
-        """Generate headers for HTTP requests"""
-        return {
-            "User-Agent": self._get_random_user_agent(),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Cache-Control": "max-age=0"
-        }
+    def _get_domain(self, url):
+        """Extract domain from URL"""
+        return urlparse(url).netloc
     
-    def _handle_rate_limiting(self, response):
-        """Handle rate limiting and other HTTP errors"""
-        if response.status_code == 429:  # Too Many Requests
-            retry_after = int(response.headers.get('Retry-After', 30))
-            time.sleep(retry_after)
-            return True
-        return False
+    def _respect_rate_limits(self, domain):
+        """Ensure minimum time between requests to the same domain"""
+        if domain in self.last_request_time:
+            elapsed = time.time() - self.last_request_time[domain]
+            if elapsed < self.min_request_interval:
+                time.sleep(self.min_request_interval - elapsed)
+        self.last_request_time[domain] = time.time()
     
-    def search_google_news(self, query, num_results=5):
-        """Search Google News with enhanced error handling and rate limiting awareness"""
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    def get(self, url, headers=None, params=None):
+        """Perform a GET request with rate limiting and retries"""
+        domain = self._get_domain(url)
+        self._respect_rate_limits(domain)
+        
+        if not headers:
+            headers = {}
+        
+        headers["User-Agent"] = self._get_random_user_agent()
+        
+        try:
+            response = self.session.get(url, headers=headers, params=params, timeout=10)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request failed for {url}: {str(e)}")
+            raise
+
+# Google News Scraper using the advanced web scraper
+class GoogleNewsScraper:
+    """A robust scraper for Google News search results"""
+    
+    def __init__(self):
+        self.base_url = "https://news.google.com/search"
+        self.scraper = AdvancedWebScraper()
+    
+    def search(self, query, num_results=8):
+        """Search Google News for the given query and return results"""
+        # Check cache first
+        cache_key = get_cache_key("google_news_search", query, num_results)
+        if cache_key in cache:
+            return cache[cache_key]
+        
         params = {
             "q": query,
             "hl": "en-US",
@@ -104,106 +138,129 @@ class WebScraper:
             "ceid": "US:en"
         }
         
-        for attempt in range(self.max_retries):
-            try:
-                # Add random delay between requests
-                time.sleep(random.uniform(*self.delay_between_requests))
-                
-                headers = self._get_headers()
-                response = requests.get(
-                    self.google_news_url, 
-                    headers=headers, 
-                    params=params,
-                    timeout=self.timeout
-                )
-                
-                if self._handle_rate_limiting(response):
-                    continue
-                    
-                response.raise_for_status()
-                
-                soup = BeautifulSoup(response.content, 'html.parser')
-                
-                articles = []
-                for article_elem in soup.select('div[jscontroller] article')[:num_results]:
-                    # Extract article data
-                    title_elem = article_elem.select_one('h3 a')
-                    time_elem = article_elem.select_one('time')
-                    source_elem = article_elem.select_one('div[data-n-tid]')
-                    
-                    if not title_elem:
-                        continue
-                    
-                    # Get title
-                    title = title_elem.text.strip()
-                    
-                    # Get URL - Transform Google News relative URLs
-                    article_url = title_elem.get('href', '')
-                    if article_url.startswith('./'):
-                        article_url = 'https://news.google.com' + article_url[1:]
-                    
-                    # Get source
-                    source = source_elem.text.strip() if source_elem else "Unknown source"
-                    
-                    # Get published date
-                    published = time_elem.get('datetime', '') if time_elem else ""
-                    
-                    # Get description (not always present)
-                    description_elem = article_elem.select_one('h3 + div') or article_elem.select_one('p')
-                    description = description_elem.text.strip() if description_elem else ""
-                    
-                    articles.append({
-                        "title": title,
-                        "url": article_url,
-                        "source": source,
-                        "published": published,
-                        "description": description
-                    })
-                    
-                return articles
-                
-            except requests.exceptions.RequestException as e:
-                if attempt == self.max_retries - 1:
-                    st.warning(f"Error accessing Google News: {str(e)}")
-                    return []
-                    
-                # Exponential backoff
-                time.sleep(2 ** attempt)
-                
-        return []
-    
-    def fetch_article_content(self, url):
-        """Fetch and parse article content with enhanced reliability"""
-        for attempt in range(self.max_retries):
-            try:
-                article = Article(url)
-                article.download()
-                article.parse()
-                
-                # Check if content was actually retrieved
-                if not article.text or len(article.text) < 100:
-                    raise ValueError("Article text too short, likely paywall or not properly parsed")
-                    
-                return {
-                    "title": article.title,
-                    "authors": article.authors,
-                    "publish_date": article.publish_date,
-                    "text": article.text[:1000] + "..." if len(article.text) > 1000 else article.text,
-                    "url": url
-                }
+        headers = {
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        
+        try:
+            response = self.scraper.get(self.base_url, headers=headers, params=params)
+            soup = BeautifulSoup(response.content, 'html.parser')
             
-            except Exception as e:
-                if attempt == self.max_retries - 1:
-                    return {
-                        "title": "Could not fetch article",
-                        "authors": [],
-                        "publish_date": None,
-                        "text": f"Error: {str(e)}",
-                        "url": url
-                    }
+            articles = []
+            # Try different selectors for better resilience against HTML changes
+            article_elements = soup.select('div[jscontroller] article') or soup.select('.IBr9hb') or soup.select('.NiLAwe')
+            
+            for article_elem in article_elements[:num_results]:
+                # Extract article data using multiple possible selectors
+                title_elem = article_elem.select_one('h3 a') or article_elem.select_one('.DY5T1d') or article_elem.select_one('a[href*="articles"]')
+                time_elem = article_elem.select_one('time') or article_elem.select_one('.WW6dff')
+                source_elem = article_elem.select_one('div[data-n-tid]') or article_elem.select_one('.wEwyrc')
                 
-                # Exponential backoff
-                time.sleep(2 ** attempt)
+                if not title_elem:
+                    continue
+                
+                # Get title
+                title = title_elem.text.strip()
+                
+                # Get URL
+                article_url = title_elem.get('href', '')
+                if article_url.startswith('./'):
+                    article_url = 'https://news.google.com' + article_url[1:]
+                
+                # Get source
+                source = source_elem.text.strip() if source_elem else "Unknown source"
+                
+                # Get published date
+                published = time_elem.get('datetime', '') if time_elem else ""
+                
+                # Get description
+                description_elem = article_elem.select_one('h3 + div') or article_elem.select_one('.xBbh9') or article_elem.select_one('p')
+                description = description_elem.text.strip() if description_elem else ""
+                
+                articles.append({
+                    "title": title,
+                    "url": article_url,
+                    "source": source,
+                    "published": published,
+                    "description": description
+                })
+            
+            # Save to cache
+            cache[cache_key] = articles
+            return articles
+            
+        except Exception as e:
+            logging.error(f"Error scraping Google News: {str(e)}")
+            return []
+
+# Functions for OpenAI analysis
+def analyze_text_with_ai(text, analysis_type="summarize"):
+    """Analyze text using OpenAI's capabilities"""
+    cache_key = get_cache_key("analyze_text_with_ai", text[:100], analysis_type)
+    if cache_key in cache:
+        return cache[cache_key]
+    
+    try:
+        if analysis_type == "summarize":
+            prompt = f"Please summarize the following text concisely, highlighting the key points:\n\n{text}"
+        elif analysis_type == "keywords":
+            prompt = f"Extract 10-15 relevant keywords from the following text. Return only the keywords separated by commas, with no explanations or introductions:\n\n{text}"
+        elif analysis_type == "themes":
+            prompt = f"Identify the main themes and topics discussed in the following text. Format as a bullet list:\n\n{text}"
+        elif analysis_type == "search_queries":
+            prompt = f"Based on the following text, generate 3-5 search queries that would help find related news articles. Make the queries specific and focused. Format as a numbered list:\n\n{text}"
+        else:
+            prompt = text
+        
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant specializing in content analysis."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=500,
+            temperature=0.3
+        )
+        
+        result = response.choices[0].message.content
+        cache[cache_key] = result
+        return result
+    except Exception as e:
+        logging.error(f"Error with OpenAI analysis: {str(e)}")
+        if analysis_type == "keywords":
+            return "error, ai, openai, connection, problem, analysis, content"
+        return f"Error performing AI analysis: {str(e)}"
+
+def ai_enhanced_keywords(text):
+    """Use AI to extract keywords from text"""
+    ai_keywords = analyze_text_with_ai(text[:4000], "keywords")  # Limit text length
+    keywords = [keyword.strip() for keyword in ai_keywords.split(',')]
+    return keywords
+
+def generate_search_queries(text):
+    """Generate optimized search queries using AI"""
+    queries_text = analyze_text_with_ai(text[:4000], "search_queries")
+    
+    # Extract queries from numbered list format
+    queries = []
+    for line in queries_text.split('\n'):
+        line = line.strip()
+        if re.match(r'^\d+\.', line):  # Lines starting with a number and period
+            query = re.sub(r'^\d+\.\s*', '', line)  # Remove the number and period
+            queries.append(query)
+    
+    # If we couldn't extract queries, use default
+    if not queries:
+        queries = [text[:100]]
+    
+    return queries
+
+def summarize_article(article_text):
+    """Summarize an article using AI"""
+    # Limit text length to avoid token limits
+    limited_text = article_text[:3000]
+    summary = analyze_text_with_ai(limited_text, "summarize")
+    return summary
 
 # Functions for text processing
 def preprocess_text(text):
@@ -221,89 +278,16 @@ def preprocess_text(text):
     
     return tokens
 
-def extract_keywords(text, num_keywords=10):
-    """Extract most frequent keywords from text"""
+def extract_keywords(text, num_keywords=10, use_ai=True):
+    """Extract keywords from text, optionally using AI"""
+    if use_ai and len(text) > 0:
+        return ai_enhanced_keywords(text)
+    
+    # Fallback to traditional NLP if AI fails or is not used
     tokens = preprocess_text(text)
-    
-    # Count frequency of each token
     freq_dist = nltk.FreqDist(tokens)
-    
-    # Get most common tokens
     keywords = [word for word, _ in freq_dist.most_common(num_keywords)]
-    
     return keywords
-
-# Enhanced AI functions using OpenAI
-def ai_analyze_content(text, max_length=4000):
-    """
-    Use OpenAI to analyze content and extract:
-    - Key topics
-    - Main arguments
-    - Sentiment
-    - Suggested search terms
-    """
-    # Truncate text if too long
-    if len(text) > max_length:
-        text = text[:max_length] + "..."
-    
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are an expert content analyzer. Extract the most important information from the provided text."},
-                {"role": "user", "content": f"Analyze the following content and provide: 1) Main topics, 2) Key arguments or points, 3) Overall sentiment, 4) Suggested search terms for finding related content. Keep your response in JSON format. Here's the content: {text}"}
-            ],
-            response_format={"type": "json_object"}
-        )
-        
-        return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        st.error(f"Error with OpenAI analysis: {str(e)}")
-        return {
-            "main_topics": [],
-            "key_arguments": [],
-            "sentiment": "unknown",
-            "suggested_search_terms": []
-        }
-
-def ai_enhance_search_query(base_query):
-    """Use OpenAI to enhance a search query for better results"""
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a search optimization expert. Your goal is to transform user queries into more effective search terms."},
-                {"role": "user", "content": f"Transform this basic search query into a more effective one that would yield better news search results. Return only the enhanced query text without explanation. Base query: {base_query}"}
-            ]
-        )
-        
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        st.warning(f"Error enhancing search query: {str(e)}")
-        return base_query
-
-def ai_summarize_news_articles(articles, query):
-    """Use OpenAI to summarize and find relationships between news articles and original query"""
-    if not articles:
-        return {"summary": "No articles found", "related_points": []}
-        
-    articles_text = "\n\n".join([f"Title: {a['title']}\nSource: {a['source']}\nDescription: {a['description']}" 
-                                for a in articles[:5]])
-    
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a news analyst who specializes in finding connections between topics."},
-                {"role": "user", "content": f"Here are some news articles related to the query '{query}':\n\n{articles_text}\n\nProvide: 1) A brief summary of how these articles relate to the original query, and 2) A list of key points that connect these articles. Format as JSON with 'summary' and 'related_points' fields."}
-            ],
-            response_format={"type": "json_object"}
-        )
-        
-        return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        st.error(f"Error with articles summarization: {str(e)}")
-        return {"summary": "Error generating summary", "related_points": []}
 
 # Functions for YouTube data extraction
 def extract_youtube_id(url):
@@ -318,35 +302,54 @@ def extract_youtube_id(url):
         return match.group(6)
     return None
 
+@st.cache_data
 def get_youtube_video_info(video_id):
     """Get title and description of a YouTube video"""
+    cache_key = get_cache_key("youtube_video_info", video_id)
+    if cache_key in cache:
+        return cache[cache_key]
+    
     youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
     
-    # Get video details
-    request = youtube.videos().list(
-        part="snippet",
-        id=video_id
-    )
-    response = request.execute()
-    
-    if not response['items']:
+    try:
+        # Get video details
+        request = youtube.videos().list(
+            part="snippet",
+            id=video_id
+        )
+        response = request.execute()
+        
+        if not response['items']:
+            return None, None
+        
+        snippet = response['items'][0]['snippet']
+        result = (snippet['title'], snippet['description'])
+        
+        # Save to cache
+        cache[cache_key] = result
+        return result
+    except Exception as e:
+        logging.error(f"Error fetching YouTube video info: {str(e)}")
         return None, None
-    
-    snippet = response['items'][0]['snippet']
-    
-    return snippet['title'], snippet['description']
 
+@st.cache_data
 def get_youtube_transcript(video_id):
     """Get transcript of a YouTube video"""
+    cache_key = get_cache_key("youtube_transcript", video_id)
+    if cache_key in cache:
+        return cache[cache_key]
+    
     try:
         transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
         
         # Concatenate all transcript segments
         transcript_text = ' '.join([item['text'] for item in transcript_list])
         
+        # Save to cache
+        cache[cache_key] = transcript_text
         return transcript_text
     except Exception as e:
-        st.error(f"Error fetching transcript: {str(e)}")
+        logging.error(f"Error fetching transcript: {str(e)}")
         return ""
 
 # Function for PDF extraction
@@ -360,27 +363,22 @@ def extract_text_from_pdf(pdf_file):
     
     return text
 
-# Functions for news search
-def search_google_news(query, num_results=5):
-    """Search Google News for a query using WebScraper"""
-    scraper = WebScraper()
-    results = scraper.search_google_news(query, num_results=num_results)
-    
+# Functions for news search with parallel execution
+def search_google_news(query, num_results=8):
+    """Search Google News for a query"""
+    scraper = GoogleNewsScraper()
+    results = scraper.search(query, num_results=num_results)
     return results
-
-def search_bing_news(query, num_results=5):
-    """Search Bing News for a query"""
-    headers = {"Ocp-Apim-Subscription-Key": BING_SEARCH_API_KEY}
-    params = {"q": query, "count": num_results, "mkt": "en-US", "freshness": "Day"}
-    
-    response = requests.get(BING_SEARCH_ENDPOINT, headers=headers, params=params)
-    response.raise_for_status()
-    search_results = response.json()
-    
-    return search_results.get("value", [])
 
 def get_google_trends(keywords, timeframe='today 1-m'):
     """Get Google Trends data for keywords"""
+    if not keywords:
+        return pd.DataFrame()
+    
+    cache_key = get_cache_key("google_trends", str(keywords), timeframe)
+    if cache_key in cache:
+        return cache[cache_key]
+    
     pytrends = TrendReq(hl='en-US', tz=360)
     
     # Only use up to 5 keywords for trends
@@ -391,365 +389,382 @@ def get_google_trends(keywords, timeframe='today 1-m'):
         pytrends.build_payload(keywords, cat=0, timeframe=timeframe, geo='', gprop='')
         trend_data = pytrends.interest_over_time()
         
+        # Save to cache
+        cache[cache_key] = trend_data
+        
         if trend_data.empty:
             return pd.DataFrame()
         
         return trend_data
     except Exception as e:
-        st.error(f"Error fetching Google Trends: {str(e)}")
+        logging.error(f"Error fetching Google Trends: {str(e)}")
         return pd.DataFrame()
 
-def parallel_fetch_content(articles, scraper):
-    """Fetch article content in parallel for better performance"""
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_article = {executor.submit(scraper.fetch_article_content, article['url']): article 
-                            for article in articles}
-        for future in concurrent.futures.as_completed(future_to_article):
-            article = future_to_article[future]
-            try:
-                data = future.result()
-                results.append((article, data))
-            except Exception as exc:
-                results.append((article, {
-                    "title": article['title'],
-                    "authors": [],
-                    "publish_date": None,
-                    "text": f"Error: {str(exc)}",
-                    "url": article['url']
-                }))
+def fetch_article_content(url):
+    """Fetch and parse article content using newspaper3k"""
+    cache_key = get_cache_key("fetch_article", url)
+    if cache_key in cache:
+        return cache[cache_key]
     
-    # Sort results back to original order
-    article_dict = {a['url']: i for i, a in enumerate(articles)}
-    results.sort(key=lambda x: article_dict.get(x[0]['url'], 0))
-    
-    return [r[1] for r in results]
+    try:
+        article = Article(url)
+        article.download()
+        article.parse()
+        
+        result = {
+            "title": article.title,
+            "authors": article.authors,
+            "publish_date": article.publish_date,
+            "text": article.text,
+            "summary": summarize_article(article.text) if len(article.text) > 300 else article.text,
+            "url": url
+        }
+        
+        # Save to cache
+        cache[cache_key] = result
+        return result
+    except Exception as e:
+        logging.error(f"Error fetching article content: {str(e)}")
+        return {
+            "title": "Could not fetch article",
+            "authors": [],
+            "publish_date": None,
+            "text": f"Error: {str(e)}",
+            "summary": "Could not generate summary",
+            "url": url
+        }
 
-# Main App UI Components
-def render_header():
-    st.title("AI-Enhanced Content Analysis & News Finder")
-    st.write("Analyze content from YouTube videos or PDF transcripts and find related news with AI assistance.")
-
-def render_input_selection():
-    return st.radio(
-        "Select input method:",
-        ["YouTube Video", "PDF Transcript"]
-    )
-
-def render_ai_settings():
-    with st.expander("AI Analysis Settings"):
-        use_ai = st.checkbox("Use AI to enhance analysis", value=True)
-        if use_ai:
-            ai_depth = st.select_slider(
-                "AI Analysis Depth",
-                options=["Basic", "Standard", "Deep"],
-                value="Standard"
-            )
-        else:
-            ai_depth = "None"
-    return use_ai, ai_depth
-
-def render_youtube_content(video_id, use_ai=True, ai_depth="Standard"):
-    st.write(f"Processing YouTube video...")
-    
-    # Show YouTube video
-    st.video(f"https://www.youtube.com/watch?v={video_id}")
-    
-    # Progress indicator
-    progress_bar = st.progress(0)
-    
-    # Get video info
-    title, description = get_youtube_video_info(video_id)
-    progress_bar.progress(20)
-    
-    transcript = get_youtube_transcript(video_id)
-    progress_bar.progress(40)
-    
-    if title:
-        st.subheader("Video Information")
-        st.write(f"**Title:** {title}")
-        
-        with st.expander("Video Description"):
-            st.write(description)
-        
-        with st.expander("Video Transcript"):
-            st.write(transcript)
-        
-        # Process text content
-        all_text = f"{title} {description} {transcript}"
-        
-        # AI Analysis section
-        if use_ai:
-            with st.spinner("Performing AI analysis..."):
-                ai_results = ai_analyze_content(all_text)
-                progress_bar.progress(60)
-                
-                st.subheader("AI Content Analysis")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.write("**Main Topics**")
-                    for topic in ai_results.get("main_topics", []):
-                        st.write(f"- {topic}")
-                    
-                    st.write("**Sentiment**")
-                    st.write(ai_results.get("sentiment", "Unknown"))
-                
-                with col2:
-                    st.write("**Key Arguments**")
-                    for point in ai_results.get("key_arguments", []):
-                        st.write(f"- {point}")
-                
-                # Use AI-suggested keywords as primary
-                keywords = ai_results.get("suggested_search_terms", [])
-                
-                # Fallback to traditional extraction if AI didn't provide enough
-                if len(keywords) < 5:
-                    trad_keywords = extract_keywords(all_text, num_keywords=10)
-                    keywords.extend([k for k in trad_keywords if k not in keywords])
-                    keywords = keywords[:15]  # Limit to 15 total
-        else:
-            keywords = extract_keywords(all_text, num_keywords=15)
-        
-        progress_bar.progress(70)
-        
-        st.subheader("Keywords")
-        st.write(", ".join(keywords))
-        
-        # Show Google Trends
-        st.subheader("Google Trends for Keywords")
-        with st.spinner("Fetching Google Trends data..."):
-            trends_data = get_google_trends(keywords)
-            
-            if not trends_data.empty:
-                st.line_chart(trends_data)
-            else:
-                st.write("No Google Trends data available for these keywords.")
-        
-        progress_bar.progress(80)
-        
-        # Create base query
-        if use_ai:
-            base_query = title + " " + " ".join(keywords[:5])
-            enhanced_query = ai_enhance_search_query(base_query)
-            primary_query = enhanced_query
-            st.write(f"**AI-enhanced search query:** {enhanced_query}")
-        else:
-            primary_query = title + " " + " ".join(keywords[:5])
-        
-        # Fetch news
-        news_results = fetch_and_display_news(primary_query, scraper=WebScraper(), use_ai=use_ai)
-        
-        progress_bar.progress(100)
-        return all_text, keywords, news_results
-    else:
-        st.error("Could not retrieve video information. Please check the URL and try again.")
-        progress_bar.progress(100)
-        return None, None, None
-
-def render_pdf_content(pdf_file, use_ai=True, ai_depth="Standard"):
-    # Extract text from PDF
-    with st.spinner("Extracting text from PDF..."):
-        text = extract_text_from_pdf(pdf_file)
-    
-    # Display extracted text
-    with st.expander("Extracted Text"):
-        st.write(text)
-    
-    # Process with AI if enabled
-    if use_ai:
-        with st.spinner("Performing AI analysis..."):
-            ai_results = ai_analyze_content(text)
-            
-            st.subheader("AI Content Analysis")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.write("**Main Topics**")
-                for topic in ai_results.get("main_topics", []):
-                    st.write(f"- {topic}")
-                
-                st.write("**Sentiment**")
-                st.write(ai_results.get("sentiment", "Unknown"))
-            
-            with col2:
-                st.write("**Key Arguments**")
-                for point in ai_results.get("key_arguments", []):
-                    st.write(f"- {point}")
-            
-            # Use AI-suggested keywords as primary
-            keywords = ai_results.get("suggested_search_terms", [])
-            
-            # Fallback to traditional extraction if AI didn't provide enough
-            if len(keywords) < 5:
-                trad_keywords = extract_keywords(text, num_keywords=10)
-                keywords.extend([k for k in trad_keywords if k not in keywords])
-                keywords = keywords[:15]  # Limit to 15 total
-    else:
-        keywords = extract_keywords(text, num_keywords=15)
-    
-    st.subheader("Keywords")
-    st.write(", ".join(keywords))
-    
-    # Show Google Trends
-    st.subheader("Google Trends for Keywords")
-    with st.spinner("Fetching Google Trends data..."):
-        trends_data = get_google_trends(keywords)
-        
-        if not trends_data.empty:
-            st.line_chart(trends_data)
-        else:
-            st.write("No Google Trends data available for these keywords.")
-    
-    # Create search query
-    if use_ai:
-        first_line = text.split('\n')[0] if '\n' in text else text[:100]
-        base_query = first_line + " " + " ".join(keywords[:5])
-        enhanced_query = ai_enhance_search_query(base_query)
-        primary_query = enhanced_query
-        st.write(f"**AI-enhanced search query:** {enhanced_query}")
-    else:
-        first_line = text.split('\n')[0] if '\n' in text else text[:100]
-        primary_query = first_line + " " + " ".join(keywords[:5])
-    
-    # Fetch news
-    news_results = fetch_and_display_news(primary_query, scraper=WebScraper(), use_ai=use_ai)
-    
-    return text, keywords, news_results
-
-def fetch_and_display_news(query, scraper, use_ai=True):
-    """Fetch and display news results with optional AI summarization"""
-    st.subheader("Related News Articles")
-    
-    # Create tabs for different news sources
-    tabs = st.tabs(["Google News", "Bing News", "Summary"])
-    
-    # Initialize results containers
+def parallel_search_news(queries, num_results=8):
+    """Execute multiple search queries in parallel"""
     google_results = []
-    bing_results = []
     
-    # Fetch Google News
-    with tabs[0]:
-        st.write("### Google News Results")
-        with st.spinner("Searching Google News..."):
-            google_results = search_google_news(query, num_results=8)
-            
-            if google_results:
-                # Fetch article content in parallel for better performance
-                article_contents = parallel_fetch_content(google_results, scraper)
-                
-                for i, (article, content) in enumerate(zip(google_results, article_contents), 1):
-                    with st.expander(f"{i}. {article['title']}"):
-                        st.write(f"**Source:** {article['source']}")
-                        st.write(f"**Published:** {article['published']}")
-                        st.write(f"**Description:** {article['description']}")
-                        st.write(f"**Link:** [{article['url']}]({article['url']})")
-                        
-                        st.write("**Article Preview:**")
-                        st.write(content['text'])
-            else:
-                st.write("No Google News results found.")
+    # Function to run in threads
+    def search_google(query):
+        return search_google_news(query, num_results)
     
-    # Fetch Bing News
-    with tabs[1]:
-        st.write("### Bing News Results")
-        with st.spinner("Searching Bing News..."):
-            bing_results = search_bing_news(query, num_results=8)
-            
-            if bing_results:
-                # Fetch article content in parallel
-                bing_article_data = [
-                    {
-                        "title": article['name'],
-                        "url": article['url'],
-                        "source": article['provider'][0]['name'],
-                        "published": article.get('datePublished', 'N/A'),
-                        "description": article['description']
-                    }
-                    for article in bing_results
-                ]
-                
-                article_contents = parallel_fetch_content(bing_article_data, scraper)
-                
-                for i, (article, content) in enumerate(zip(bing_results, article_contents), 1):
-                    with st.expander(f"{i}. {article['name']}"):
-                        st.write(f"**Source:** {article['provider'][0]['name']}")
-                        st.write(f"**Published:** {article.get('datePublished', 'N/A')}")
-                        st.write(f"**Description:** {article['description']}")
-                        st.write(f"**Link:** [{article['url']}]({article['url']})")
-                        
-                        st.write("**Article Preview:**")
-                        st.write(content['text'])
-            else:
-                st.write("No Bing News results found.")
+    # Use ThreadPoolExecutor to run queries in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(queries), 5)) as executor:
+        future_to_query = {executor.submit(search_google, query): query for query in queries}
+        for future in concurrent.futures.as_completed(future_to_query):
+            results = future.result()
+            google_results.extend(results)
     
-    # AI Summary of News Articles
-    with tabs[2]:
-        st.write("### News Summary")
+    # Remove duplicates based on URL
+    unique_google = []
+    seen_urls = set()
+    for article in google_results:
+        if article['url'] not in seen_urls:
+            unique_google.append(article)
+            seen_urls.add(article['url'])
+    
+    return unique_google
+
+# Streamlit UI Components
+def render_header():
+    """Render the app header with styling"""
+    st.title("🧠 AI-Powered Content Analyzer & News Explorer")
+    st.markdown("""
+    <style>
+    .stTitle {
+        font-size: 2.5rem !important;
+        color: #4B61D1 !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("""
+    This application uses AI to analyze content from YouTube videos or PDF transcripts, 
+    extract key insights, and find related news articles from Google News.
+    """)
+
+def render_sidebar():
+    """Render the sidebar with options"""
+    with st.sidebar:
+        st.header("Options & Settings")
         
-        if use_ai and (google_results or bing_results):
-            with st.spinner("Generating AI summary of news articles..."):
-                # Combine results for summary
-                combined_results = google_results[:5]
-                if len(combined_results) < 5 and bing_results:
-                    # Add unique bing results to get up to 5 total
-                    bing_urls = [b['url'] for b in bing_results]
-                    google_urls = [g['url'] for g in google_results]
-                    unique_bing = [
-                        {
-                            "title": b['name'],
-                            "url": b['url'],
-                            "source": b['provider'][0]['name'],
-                            "description": b['description']
-                        }
-                        for b in bing_results if b['url'] not in google_urls
-                    ]
-                    combined_results.extend(unique_bing[:5-len(combined_results)])
-                
-                summary = ai_summarize_news_articles(combined_results, query)
-                
-                st.write("#### Overview")
-                st.write(summary.get("summary", "No summary available"))
-                
-                st.write("#### Key Connections")
-                for point in summary.get("related_points", []):
-                    st.write(f"- {point}")
-        else:
-            st.write("Enable AI analysis or search for news to see a summary.")
-    
-    # Return combined results
+        ai_analysis = st.toggle("Enable AI Analysis", value=True, 
+                               help="Use OpenAI to enhance analysis (better keywords, summaries, etc.)")
+        
+        st.subheader("Search Settings")
+        news_count = st.slider("Number of news results", min_value=3, max_value=20, value=10,
+                              help="Maximum number of news articles to retrieve")
+        
+        trends_timeframe = st.selectbox(
+            "Google Trends timeframe",
+            options=["today 1-m", "today 3-m", "today 12-m", "today 5-y"],
+            format_func=lambda x: {
+                "today 1-m": "Past month",
+                "today 3-m": "Past 3 months",
+                "today 12-m": "Past year",
+                "today 5-y": "Past 5 years"
+            }[x],
+            help="Time period for Google Trends data"
+        )
+        
+        st.markdown("---")
+        st.markdown("### About")
+        st.markdown("This app uses:")
+        st.markdown("- OpenAI GPT for content analysis")
+        st.markdown("- YouTube Data & Transcript APIs")
+        st.markdown("- Google News & Google Trends")
+        st.markdown("- Advanced web scraping techniques")
+        
     return {
-        "google_results": google_results,
-        "bing_results": bing_results
+        "ai_analysis": ai_analysis,
+        "news_count": news_count,
+        "trends_timeframe": trends_timeframe
     }
 
 # Main App
 def main():
     render_header()
+    options = render_sidebar()
     
-    input_method = render_input_selection()
-    use_ai, ai_depth = render_ai_settings()
+    # Input method selection
+    input_method = st.radio(
+        "Select input method:",
+        ["YouTube Video", "PDF Transcript"],
+        horizontal=True
+    )
     
     if input_method == "YouTube Video":
-        youtube_url = st.text_input("Enter YouTube video URL:")
-        
-        if youtube_url:
-            video_id = extract_youtube_id(youtube_url)
-            
-            if video_id:
-                content, keywords, news = render_youtube_content(video_id, use_ai, ai_depth)
-            else:
-                st.error("Invalid YouTube URL. Please enter a valid YouTube video URL.")
-    
+        process_youtube_input(options)
     elif input_method == "PDF Transcript":
-        uploaded_file = st.file_uploader("Upload video transcript PDF", type="pdf")
-        
-        if uploaded_file is not None:
-            content, keywords, news = render_pdf_content(uploaded_file, use_ai, ai_depth)
+        process_pdf_input(options)
+
+def process_youtube_input(options):
+    youtube_url = st.text_input("Enter YouTube video URL:", placeholder="https://www.youtube.com/watch?v=...")
     
-    # Include footer with info
-    st.markdown("---")
-    st.markdown("Built with Streamlit and OpenAI. Analyzes content and finds related news from Google News, Google Trends, and Bing News.")
+    if not youtube_url:
+        # Show demo section when no URL is entered
+        st.info("Enter a YouTube URL above to analyze its content and find related news.")
+        return
+    
+    video_id = extract_youtube_id(youtube_url)
+    
+    if not video_id:
+        st.error("Invalid YouTube URL. Please enter a valid YouTube video URL.")
+        return
+    
+    with st.spinner("Processing YouTube video..."):
+        # Show YouTube video
+        st.video(youtube_url)
+        
+        # Get video info
+        title, description = get_youtube_video_info(video_id)
+        if not title:
+            st.error("Could not retrieve video information. Please check the URL and try again.")
+            return
+        
+        transcript = get_youtube_transcript(video_id)
+        
+        st.subheader("Video Information")
+        st.write(f"**Title:** {title}")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            with st.expander("Video Description", expanded=False):
+                st.write(description)
+        
+        with col2:
+            with st.expander("Video Transcript Preview", expanded=False):
+                st.write(transcript[:500] + "..." if len(transcript) > 500 else transcript)
+                if len(transcript) > 500:
+                    st.download_button(
+                        label="Download Full Transcript",
+                        data=transcript,
+                        file_name=f"{video_id}_transcript.txt"
+                    )
+        
+        # Process text content
+        all_text = f"{title} {description} {transcript}"
+        
+        if options["ai_analysis"] and len(all_text) > 0:
+            with st.spinner("Performing AI analysis of content..."):
+                # AI content analysis
+                summary = analyze_text_with_ai(all_text, "summarize")
+                themes = analyze_text_with_ai(all_text, "themes")
+                ai_keywords = ai_enhanced_keywords(all_text)
+                
+                # Display AI insights
+                st.subheader("AI Content Analysis")
+                
+                tab1, tab2, tab3 = st.tabs(["Summary", "Main Themes", "Keywords"])
+                
+                with tab1:
+                    st.markdown(summary)
+                
+                with tab2:
+                    st.markdown(themes)
+                
+                with tab3:
+                    st.write(", ".join(ai_keywords))
+                
+                # Generate search queries
+                search_queries = generate_search_queries(all_text)
+                
+                # Show Google Trends for AI keywords
+                if ai_keywords:
+                    st.subheader("Google Trends for Keywords")
+                    with st.spinner("Loading Google Trends data..."):
+                        trends_data = get_google_trends(ai_keywords, options["trends_timeframe"])
+                        
+                        if not trends_data.empty:
+                            st.line_chart(trends_data)
+                        else:
+                            st.info("No Google Trends data available for these keywords.")
+        else:
+            # Traditional NLP analysis if AI is disabled
+            keywords = extract_keywords(all_text, num_keywords=15, use_ai=False)
+            
+            st.subheader("Extracted Keywords")
+            st.write(", ".join(keywords))
+            
+            # Show Google Trends
+            st.subheader("Google Trends for Keywords")
+            with st.spinner("Loading Google Trends data..."):
+                trends_data = get_google_trends(keywords, options["trends_timeframe"])
+                
+                if not trends_data.empty:
+                    st.line_chart(trends_data)
+                else:
+                    st.info("No Google Trends data available for these keywords.")
+            
+            # Use title and keywords for search
+            search_queries = [f"{title} {' '.join(keywords[:5])}"]
+        
+        # Search for news using the AI-generated queries
+        st.subheader("Related News Articles")
+        
+        with st.spinner("Searching for related news articles..."):
+            google_results = parallel_search_news(search_queries, options["news_count"])
+            
+            if not google_results:
+                st.info("No news results found. Try different keywords or search terms.")
+                
+            for i, article in enumerate(google_results, 1):
+                with st.expander(f"{i}. {article['title']}"):
+                    st.write(f"**Source:** {article['source']}")
+                    st.write(f"**Published:** {article['published']}")
+                    st.write(f"**Description:** {article['description']}")
+                    
+                    # Add a button to fetch full article content
+                    if st.button(f"Load full article content #{i}", key=f"google_{i}"):
+                        with st.spinner("Fetching article content..."):
+                            article_content = fetch_article_content(article['url'])
+                            st.write("**Article Summary:**")
+                            st.write(article_content['summary'])
+                            
+                            with st.expander("View Full Article Text"):
+                                st.write(article_content['text'])
+                    
+                    st.write(f"**Link:** [{article['url']}]({article['url']})")
+
+def process_pdf_input(options):
+    uploaded_file = st.file_uploader("Upload video transcript PDF", type="pdf")
+    
+    if not uploaded_file:
+        st.info("Upload a PDF file containing video transcripts to analyze.")
+        return
+    
+    # Extract text from PDF
+    with st.spinner("Extracting text from PDF..."):
+        text = extract_text_from_pdf(uploaded_file)
+    
+    # Display extracted text preview
+    st.subheader("PDF Content")
+    with st.expander("Extracted Text Preview"):
+        st.write(text[:1000] + "..." if len(text) > 1000 else text)
+        if len(text) > 1000:
+            st.download_button(
+                label="Download Full Text",
+                data=text,
+                file_name=f"{uploaded_file.name.split('.')[0]}_text.txt"
+            )
+    
+    # Process text content with AI if enabled
+    if options["ai_analysis"] and len(text) > 0:
+        with st.spinner("Performing AI analysis of content..."):
+            # AI content analysis
+            summary = analyze_text_with_ai(text, "summarize")
+            themes = analyze_text_with_ai(text, "themes")
+            ai_keywords = ai_enhanced_keywords(text)
+            
+            # Display AI insights
+            st.subheader("AI Content Analysis")
+            
+            tab1, tab2, tab3 = st.tabs(["Summary", "Main Themes", "Keywords"])
+            
+            with tab1:
+                st.markdown(summary)
+            
+            with tab2:
+                st.markdown(themes)
+            
+            with tab3:
+                st.write(", ".join(ai_keywords))
+            
+            # Generate search queries
+            search_queries = generate_search_queries(text)
+            
+            # Show Google Trends for AI keywords
+            if ai_keywords:
+                st.subheader("Google Trends for Keywords")
+                with st.spinner("Loading Google Trends data..."):
+                    trends_data = get_google_trends(ai_keywords, options["trends_timeframe"])
+                    
+                    if not trends_data.empty:
+                        st.line_chart(trends_data)
+                    else:
+                        st.info("No Google Trends data available for these keywords.")
+    else:
+        # Traditional NLP analysis if AI is disabled
+        keywords = extract_keywords(text, num_keywords=15, use_ai=False)
+        
+        st.subheader("Extracted Keywords")
+        st.write(", ".join(keywords))
+        
+        # Show Google Trends
+        st.subheader("Google Trends for Keywords")
+        with st.spinner("Loading Google Trends data..."):
+            trends_data = get_google_trends(keywords, options["trends_timeframe"])
+            
+            if not trends_data.empty:
+                st.line_chart(trends_data)
+            else:
+                st.info("No Google Trends data available for these keywords.")
+        
+        # Create search query from first line and keywords
+        first_line = text.split('\n')[0] if '\n' in text else text[:100]
+        search_queries = [f"{first_line} {' '.join(keywords[:5])}"]
+    
+    # Search for news using the AI-generated queries
+    st.subheader("Related News Articles")
+    
+    with st.spinner("Searching for related news articles..."):
+        google_results = parallel_search_news(search_queries, options["news_count"])
+        
+        if not google_results:
+            st.info("No news results found. Try different keywords or search terms.")
+        
+        for i, article in enumerate(google_results, 1):
+            with st.expander(f"{i}. {article['title']}"):
+                st.write(f"**Source:** {article['source']}")
+                st.write(f"**Published:** {article['published']}")
+                st.write(f"**Description:** {article['description']}")
+                
+                # Add a button to fetch full article content
+                if st.button(f"Load full article content #{i}", key=f"google_pdf_{i}"):
+                    with st.spinner("Fetching article content..."):
+                        article_content = fetch_article_content(article['url'])
+                        st.write("**Article Summary:**")
+                        st.write(article_content['summary'])
+                        
+                        with st.expander("View Full Article Text"):
+                            st.write(article_content['text'])
+                
+                st.write(f"**Link:** [{article['url']}]({article['url']})")
 
 if __name__ == "__main__":
     main()
